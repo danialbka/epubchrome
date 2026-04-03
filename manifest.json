@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Page to EPUB",
+  "version": "0.1.0",
+  "description": "Convert the current web page into a simple EPUB ebook.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Page to EPUB",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "defuddle.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
