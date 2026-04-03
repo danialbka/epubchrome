@@ -1,21 +1,205 @@
+const SETTINGS_KEY = "epublySettings";
+const PAIRING_KEY = "epublyPairing";
+const DEFAULT_SITE_URL = "https://www.epubly.net";
+const PAIRING_SUCCESS_PATH = "/extension-connected";
+const PAIRING_CONNECT_PATH = "/extension-connect";
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type !== "convert-tab-to-epub") {
+  if (
+    message?.type !== "convert-tab-to-epub" &&
+    message?.type !== "upload-tab-to-epubly" &&
+    message?.type !== "start-epubly-pairing" &&
+    message?.type !== "disconnect-epubly"
+  ) {
     return;
   }
 
-  convertTabToEpub(message.tabId)
+  let operation;
+  if (message.type === "upload-tab-to-epubly") {
+    operation = uploadTabToEpubly(message.tabId, {
+      apiBaseUrl: message.apiBaseUrl,
+      accessToken: message.accessToken
+    });
+  } else if (message.type === "start-epubly-pairing") {
+    operation = startEpublyPairing(message.siteUrl);
+  } else if (message.type === "disconnect-epubly") {
+    operation = disconnectEpubly();
+  } else {
+    operation = convertTabToEpub(message.tabId);
+  }
+
+  operation
     .then((result) => sendResponse({ ok: true, ...result }))
     .catch((error) => {
       sendResponse({
         ok: false,
-        error: error instanceof Error ? error.message : "EPUB creation failed."
+        error: error instanceof Error ? error.message : "EPUB action failed."
       });
     });
 
   return true;
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url || tab?.url) {
+    void handlePairingTabUpdate(tabId, changeInfo.url || tab.url || "");
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void clearPairingIfClosed(tabId);
+});
+
+async function startEpublyPairing(siteUrl) {
+  const normalizedSiteUrl = normalizeSiteUrl(siteUrl) || DEFAULT_SITE_URL;
+  const existingPairing = await readStorageValue(PAIRING_KEY);
+  if (existingPairing?.tabId) {
+    try {
+      await chrome.tabs.remove(existingPairing.tabId);
+    } catch {
+      // Ignore missing tabs.
+    }
+  }
+
+  const nonce = createPairingNonce();
+  const pairingUrl = `${normalizedSiteUrl}${PAIRING_CONNECT_PATH}?nonce=${encodeURIComponent(nonce)}`;
+  const tab = await chrome.tabs.create({
+    url: pairingUrl,
+    active: true
+  });
+
+  if (!tab?.id) {
+    throw new Error("Could not open the EPUBly pairing tab.");
+  }
+
+  const existingSettings = (await readStorageValue(SETTINGS_KEY)) || {};
+  await chrome.storage.local.set({
+    [SETTINGS_KEY]: {
+      ...existingSettings,
+      siteUrl: normalizedSiteUrl
+    },
+    [PAIRING_KEY]: {
+      nonce,
+      tabId: tab.id,
+      siteUrl: normalizedSiteUrl,
+      startedAt: Date.now()
+    }
+  });
+
+  return { pairingStarted: true };
+}
+
+async function disconnectEpubly() {
+  const pairing = await readStorageValue(PAIRING_KEY);
+  if (pairing?.tabId) {
+    try {
+      await chrome.tabs.remove(pairing.tabId);
+    } catch {
+      // Ignore missing tabs.
+    }
+  }
+
+  await chrome.storage.local.remove([SETTINGS_KEY, PAIRING_KEY]);
+  return { disconnected: true };
+}
+
+async function handlePairingTabUpdate(tabId, tabUrl) {
+  if (!tabUrl) {
+    return;
+  }
+
+  const pairing = await readStorageValue(PAIRING_KEY);
+  if (!pairing || pairing.tabId !== tabId) {
+    return;
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(tabUrl);
+  } catch {
+    return;
+  }
+
+  if (parsedUrl.pathname !== PAIRING_SUCCESS_PATH) {
+    return;
+  }
+
+  const hashParams = new URLSearchParams(parsedUrl.hash.replace(/^#/, ""));
+  const nonce = hashParams.get("nonce");
+  const accessToken = hashParams.get("accessToken");
+  const apiBaseUrl = normalizeUrl(hashParams.get("apiBaseUrl"));
+  const appBaseUrl = normalizeUrl(hashParams.get("appBaseUrl"));
+
+  if (!nonce || nonce !== pairing.nonce || !accessToken || !apiBaseUrl) {
+    return;
+  }
+
+  await chrome.storage.local.set({
+    [SETTINGS_KEY]: {
+      siteUrl: pairing.siteUrl,
+      apiBaseUrl,
+      accessToken,
+      appBaseUrl: appBaseUrl || pairing.siteUrl,
+      connectedAt: Date.now()
+    }
+  });
+  await chrome.storage.local.remove(PAIRING_KEY);
+
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch {
+    // Ignore tabs that are already closed.
+  }
+}
+
+async function clearPairingIfClosed(tabId) {
+  const pairing = await readStorageValue(PAIRING_KEY);
+  if (!pairing || pairing.tabId !== tabId) {
+    return;
+  }
+
+  await chrome.storage.local.remove(PAIRING_KEY);
+}
+
+async function readStorageValue(key) {
+  const stored = await chrome.storage.local.get(key);
+  return stored?.[key];
+}
+
+function createPairingNonce() {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+function normalizeSiteUrl(value) {
+  return normalizeUrl(value || DEFAULT_SITE_URL);
+}
+
 async function convertTabToEpub(tabId) {
+  const prepared = await prepareTabEpub(tabId);
+  const url = await blobToDataUrl(prepared.epubBlob);
+
+  await chrome.downloads.download({
+    url,
+    filename: prepared.filename,
+    saveAs: true
+  });
+
+  return { filename: prepared.filename };
+}
+
+async function uploadTabToEpubly(tabId, options) {
+  const prepared = await prepareTabEpub(tabId);
+  const uploadResult = await uploadEpubToLibrary(prepared, options);
+
+  return {
+    filename: prepared.filename,
+    bookId: uploadResult.bookId,
+    bookUrl: uploadResult.bookUrl,
+    libraryUrl: uploadResult.libraryUrl
+  };
+}
+
+async function prepareTabEpub(tabId) {
   const tab = await chrome.tabs.get(tabId);
 
   if (!tab?.id) {
@@ -33,15 +217,13 @@ async function convertTabToEpub(tabId) {
 
   const epubBlob = await buildEpub(extraction.payload);
   const filename = `${safeFileName(extraction.payload.title || "page")}.epub`;
-  const url = await blobToDataUrl(epubBlob);
 
-  await chrome.downloads.download({
-    url,
-    filename,
-    saveAs: true
-  });
-
-  return { filename };
+  return {
+    tab,
+    payload: extraction.payload,
+    epubBlob,
+    filename
+  };
 }
 
 async function extractPageFromTab(tabId) {
@@ -62,6 +244,106 @@ async function extractPageFromTab(tabId) {
 
     return chrome.tabs.sendMessage(tabId, { type: "extract-page" });
   }
+}
+
+async function uploadEpubToLibrary(prepared, options) {
+  const apiBaseUrl = normalizeUrl(options?.apiBaseUrl);
+  const accessToken = String(options?.accessToken || "").trim();
+
+  if (!apiBaseUrl) {
+    throw new Error("Missing EPUBly upload API URL.");
+  }
+
+  if (!accessToken) {
+    throw new Error("Missing EPUBly upload token.");
+  }
+
+  await postJson(`${apiBaseUrl}/epubchrome/auth/check`, accessToken, {});
+
+  const start = await postJson(`${apiBaseUrl}/epubchrome/upload/start`, accessToken, {
+    format: "epub",
+    title: prepared.payload.title || "Untitled page",
+    originalFilename: prepared.filename
+  });
+
+  if (!start?.uploadUrl || !start?.uploadTicketId) {
+    throw new Error("Upload start failed.");
+  }
+
+  const storageId = await uploadBlobToStorage(start.uploadUrl, prepared.epubBlob);
+  const complete = await postJson(`${apiBaseUrl}/epubchrome/upload/complete`, accessToken, {
+    uploadTicketId: start.uploadTicketId,
+    storageId,
+    format: "epub",
+    title: prepared.payload.title || "Untitled page",
+    author: prepared.payload.author || "",
+    originalFilename: prepared.filename,
+    fileSize: prepared.epubBlob.size,
+    sourceUrl: prepared.payload.sourceUrl || prepared.tab?.url || ""
+  });
+
+  return {
+    bookId: complete?.bookId || null,
+    bookUrl: typeof complete?.bookUrl === "string" ? complete.bookUrl : null,
+    libraryUrl: typeof complete?.libraryUrl === "string" ? complete.libraryUrl : null
+  };
+}
+
+function normalizeUrl(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
+async function postJson(url, accessToken, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body || {})
+  });
+
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(payload?.error || `Request failed (${response.status}).`);
+  }
+
+  return payload;
+}
+
+async function readJsonResponse(response) {
+  const text = await response.text();
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: text.trim() || "Unexpected response." };
+  }
+}
+
+async function uploadBlobToStorage(uploadUrl, blob) {
+  const response = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": blob.type || "application/epub+zip"
+    },
+    body: blob
+  });
+
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(payload?.error || `Upload failed (${response.status}).`);
+  }
+
+  const storageId = payload?.storageId || payload?.storage_id || payload?.id;
+  if (typeof storageId !== "string" || !storageId) {
+    throw new Error("Upload failed (missing storage id).");
+  }
+
+  return storageId;
 }
 
 async function buildEpub(payload) {

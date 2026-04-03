@@ -1,27 +1,130 @@
+const SETTINGS_KEY = "epublySettings";
+const PAIRING_KEY = "epublyPairing";
+const DEFAULT_SITE_URL = "https://www.epubly.net";
+
+const siteUrlInput = document.getElementById("siteUrl");
+const connectButton = document.getElementById("connectButton");
+const uploadButton = document.getElementById("uploadButton");
+const disconnectButton = document.getElementById("disconnectButton");
 const convertButton = document.getElementById("convertButton");
 const statusElement = document.getElementById("status");
 const pageTitleElement = document.getElementById("pageTitle");
+const connectionStateElement = document.getElementById("connectionState");
+const connectionMetaElement = document.getElementById("connectionMeta");
+
+let activeTabId = null;
 
 init();
 
 async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const title = tab?.title?.trim() || "Current tab";
-  pageTitleElement.textContent = title;
+  activeTabId = tab?.id ?? null;
+  pageTitleElement.textContent = tab?.title?.trim() || "Current tab";
 
-  convertButton.addEventListener("click", async () => {
-    if (!tab?.id) {
+  await refreshUi();
+
+  connectButton.addEventListener("click", async () => {
+    const siteUrl = normalizeUrl(siteUrlInput.value) || DEFAULT_SITE_URL;
+    siteUrlInput.value = siteUrl;
+
+    setBusy(true, "pairing");
+    setStatus("Opening EPUBly connection page...");
+
+    try {
+      await chrome.storage.local.set({
+        [SETTINGS_KEY]: {
+          ...(await readSettings()),
+          siteUrl
+        }
+      });
+
+      const response = await chrome.runtime.sendMessage({
+        type: "start-epubly-pairing",
+        siteUrl
+      });
+
+      if (!response?.ok) {
+        throw new Error(response?.error || "Could not start EPUBly pairing.");
+      }
+
+      setStatus("Approve the connection in the EPUBly tab, then reopen the extension.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not start pairing.", "error");
+    } finally {
+      setBusy(false);
+      await refreshUi();
+    }
+  });
+
+  disconnectButton.addEventListener("click", async () => {
+    setBusy(true, "disconnect");
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "disconnect-epubly"
+      });
+
+      if (!response?.ok) {
+        throw new Error(response?.error || "Could not disconnect EPUBly.");
+      }
+
+      setStatus("Disconnected EPUBly.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not disconnect EPUBly.", "error");
+    } finally {
+      setBusy(false);
+      await refreshUi();
+    }
+  });
+
+  uploadButton.addEventListener("click", async () => {
+    if (!activeTabId) {
       setStatus("No active tab found.", "error");
       return;
     }
 
-    setBusy(true);
+    const settings = await readSettings();
+    if (!settings.apiBaseUrl || !settings.accessToken) {
+      setStatus("Connect EPUBly first.", "error");
+      return;
+    }
+
+    setBusy(true, "upload");
+    setStatus("Extracting and uploading...");
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "upload-tab-to-epubly",
+        tabId: activeTabId,
+        apiBaseUrl: settings.apiBaseUrl,
+        accessToken: settings.accessToken
+      });
+
+      if (!response?.ok) {
+        throw new Error(response?.error || "Upload failed.");
+      }
+
+      setStatus(response.bookUrl ? `Uploaded to library. ${response.bookUrl}` : `Uploaded ${response.filename}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Upload failed.", "error");
+    } finally {
+      setBusy(false);
+      await refreshUi();
+    }
+  });
+
+  convertButton.addEventListener("click", async () => {
+    if (!activeTabId) {
+      setStatus("No active tab found.", "error");
+      return;
+    }
+
+    setBusy(true, "download");
     setStatus("Extracting content...");
 
     try {
       const response = await chrome.runtime.sendMessage({
         type: "convert-tab-to-epub",
-        tabId: tab.id
+        tabId: activeTabId
       });
 
       if (!response?.ok) {
@@ -30,16 +133,64 @@ async function init() {
 
       setStatus(`Saved as ${response.filename}`);
     } catch (error) {
-      setStatus(error.message || "Conversion failed.", "error");
+      setStatus(error instanceof Error ? error.message : "Conversion failed.", "error");
     } finally {
       setBusy(false);
+      await refreshUi();
     }
   });
 }
 
-function setBusy(isBusy) {
+async function refreshUi() {
+  const [settings, pairing] = await Promise.all([readSettings(), readPairing()]);
+  const siteUrl = settings.siteUrl || settings.appBaseUrl || DEFAULT_SITE_URL;
+  siteUrlInput.value = siteUrl;
+
+  const isConnected = Boolean(settings.apiBaseUrl && settings.accessToken);
+  const isPairing = Boolean(pairing?.nonce);
+
+  if (isConnected) {
+    connectionStateElement.textContent = "Connected";
+    connectionMetaElement.textContent = settings.appBaseUrl
+      ? `Uploads go to ${settings.appBaseUrl}`
+      : "EPUBChrome can upload directly into your library.";
+  } else if (isPairing) {
+    connectionStateElement.textContent = "Awaiting approval";
+    connectionMetaElement.textContent = `Finish approval in the EPUBly tab for ${pairing.siteUrl || siteUrl}.`;
+  } else {
+    connectionStateElement.textContent = "Not connected";
+    connectionMetaElement.textContent = "Connect EPUBChrome to upload directly into your library.";
+  }
+
+  uploadButton.disabled = !isConnected;
+  disconnectButton.disabled = !isConnected && !isPairing;
+}
+
+async function readSettings() {
+  const stored = await chrome.storage.local.get(SETTINGS_KEY);
+  return stored?.[SETTINGS_KEY] || {};
+}
+
+async function readPairing() {
+  const stored = await chrome.storage.local.get(PAIRING_KEY);
+  return stored?.[PAIRING_KEY] || null;
+}
+
+function normalizeUrl(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
+function setBusy(isBusy, mode = "idle") {
+  siteUrlInput.disabled = isBusy;
+  connectButton.disabled = isBusy;
+  disconnectButton.disabled = isBusy;
+  uploadButton.disabled = isBusy;
   convertButton.disabled = isBusy;
-  convertButton.textContent = isBusy ? "Converting..." : "Convert current page";
+
+  connectButton.textContent = isBusy && mode === "pairing" ? "Connecting..." : "Connect to EPUBly";
+  disconnectButton.textContent = isBusy && mode === "disconnect" ? "Disconnecting..." : "Disconnect EPUBly";
+  uploadButton.textContent = isBusy && mode === "upload" ? "Uploading..." : "Upload to EPUBly";
+  convertButton.textContent = isBusy && mode === "download" ? "Downloading..." : "Download EPUB";
 }
 
 function setStatus(message, state = "info") {
