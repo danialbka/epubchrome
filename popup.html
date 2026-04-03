@@ -11,10 +11,6 @@
       <p class="eyebrow">Chrome Extension</p>
       <h1>Page to EPUB</h1>
       <p id="pageTitle" class="page-title">Current tab</p>
-      <label class="field">
-        <span class="field-label">EPUBly website URL</span>
-        <input id="siteUrl" type="url" spellcheck="false" placeholder="https://www.epubly.net">
-      </label>
       <div id="connectionCard" class="connection-card">
         <p id="connectionState" class="connection-state">Not connected</p>
         <p id="connectionMeta" class="connection-meta">Connect EPUBChrome to upload directly into your library.</p>
@@ -25,7 +21,10 @@
       </div>
       <button id="disconnectButton" type="button" class="secondary">Disconnect EPUBly</button>
       <button id="convertButton" type="button" class="secondary">Download EPUB</button>
-      <p id="status" class="status" aria-live="polite"></p>
+      <div class="status-block" aria-live="polite">
+        <p id="status" class="status"></p>
+        <a id="statusLink" class="status-link" href="#" target="_blank" rel="noreferrer noopener" hidden>Open library</a>
+      </div>
     </main>
     <script src="popup.js"></script>
   </body>

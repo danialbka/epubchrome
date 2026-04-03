@@ -2,12 +2,12 @@ const SETTINGS_KEY = "epublySettings";
 const PAIRING_KEY = "epublyPairing";
 const DEFAULT_SITE_URL = "https://www.epubly.net";
 
-const siteUrlInput = document.getElementById("siteUrl");
 const connectButton = document.getElementById("connectButton");
 const uploadButton = document.getElementById("uploadButton");
 const disconnectButton = document.getElementById("disconnectButton");
 const convertButton = document.getElementById("convertButton");
 const statusElement = document.getElementById("status");
+const statusLinkElement = document.getElementById("statusLink");
 const pageTitleElement = document.getElementById("pageTitle");
 const connectionStateElement = document.getElementById("connectionState");
 const connectionMetaElement = document.getElementById("connectionMeta");
@@ -24,23 +24,13 @@ async function init() {
   await refreshUi();
 
   connectButton.addEventListener("click", async () => {
-    const siteUrl = normalizeUrl(siteUrlInput.value) || DEFAULT_SITE_URL;
-    siteUrlInput.value = siteUrl;
-
     setBusy(true, "pairing");
     setStatus("Opening EPUBly connection page...");
 
     try {
-      await chrome.storage.local.set({
-        [SETTINGS_KEY]: {
-          ...(await readSettings()),
-          siteUrl
-        }
-      });
-
       const response = await chrome.runtime.sendMessage({
         type: "start-epubly-pairing",
-        siteUrl
+        siteUrl: DEFAULT_SITE_URL
       });
 
       if (!response?.ok) {
@@ -103,7 +93,8 @@ async function init() {
         throw new Error(response?.error || "Upload failed.");
       }
 
-      setStatus(response.bookUrl ? `Uploaded to library. ${response.bookUrl}` : `Uploaded ${response.filename}`);
+      setStatus(response.bookUrl ? "Uploaded to your library." : `Uploaded ${response.filename}`);
+      setStatusLink(response.bookUrl, "Open library");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Upload failed.", "error");
     } finally {
@@ -143,9 +134,6 @@ async function init() {
 
 async function refreshUi() {
   const [settings, pairing] = await Promise.all([readSettings(), readPairing()]);
-  const siteUrl = settings.siteUrl || settings.appBaseUrl || DEFAULT_SITE_URL;
-  siteUrlInput.value = siteUrl;
-
   const isConnected = Boolean(settings.apiBaseUrl && settings.accessToken);
   const isPairing = Boolean(pairing?.nonce);
 
@@ -156,7 +144,7 @@ async function refreshUi() {
       : "EPUBChrome can upload directly into your library.";
   } else if (isPairing) {
     connectionStateElement.textContent = "Awaiting approval";
-    connectionMetaElement.textContent = `Finish approval in the EPUBly tab for ${pairing.siteUrl || siteUrl}.`;
+    connectionMetaElement.textContent = `Finish approval in the EPUBly tab for ${pairing.siteUrl || DEFAULT_SITE_URL}.`;
   } else {
     connectionStateElement.textContent = "Not connected";
     connectionMetaElement.textContent = "Connect EPUBChrome to upload directly into your library.";
@@ -181,7 +169,6 @@ function normalizeUrl(value) {
 }
 
 function setBusy(isBusy, mode = "idle") {
-  siteUrlInput.disabled = isBusy;
   connectButton.disabled = isBusy;
   disconnectButton.disabled = isBusy;
   uploadButton.disabled = isBusy;
@@ -196,4 +183,18 @@ function setBusy(isBusy, mode = "idle") {
 function setStatus(message, state = "info") {
   statusElement.textContent = message;
   statusElement.dataset.state = state;
+  setStatusLink(null);
+}
+
+function setStatusLink(url, label = "Open") {
+  if (!url) {
+    statusLinkElement.hidden = true;
+    statusLinkElement.removeAttribute("href");
+    statusLinkElement.textContent = "";
+    return;
+  }
+
+  statusLinkElement.href = url;
+  statusLinkElement.textContent = label;
+  statusLinkElement.hidden = false;
 }

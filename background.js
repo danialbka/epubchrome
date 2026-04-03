@@ -62,7 +62,9 @@ async function startEpublyPairing(siteUrl) {
   }
 
   const nonce = createPairingNonce();
-  const pairingUrl = `${normalizedSiteUrl}${PAIRING_CONNECT_PATH}?nonce=${encodeURIComponent(nonce)}`;
+  const verifier = createPairingVerifier();
+  const challenge = await hashStringHex(verifier);
+  const pairingUrl = `${normalizedSiteUrl}${PAIRING_CONNECT_PATH}?nonce=${encodeURIComponent(nonce)}&challenge=${encodeURIComponent(challenge)}`;
   const tab = await chrome.tabs.create({
     url: pairingUrl,
     active: true
@@ -80,6 +82,7 @@ async function startEpublyPairing(siteUrl) {
     },
     [PAIRING_KEY]: {
       nonce,
+      verifier,
       tabId: tab.id,
       siteUrl: normalizedSiteUrl,
       startedAt: Date.now()
@@ -124,13 +127,24 @@ async function handlePairingTabUpdate(tabId, tabUrl) {
     return;
   }
 
-  const hashParams = new URLSearchParams(parsedUrl.hash.replace(/^#/, ""));
-  const nonce = hashParams.get("nonce");
-  const accessToken = hashParams.get("accessToken");
-  const apiBaseUrl = normalizeUrl(hashParams.get("apiBaseUrl"));
-  const appBaseUrl = normalizeUrl(hashParams.get("appBaseUrl"));
+  const queryParams = new URLSearchParams(parsedUrl.search);
+  const nonce = queryParams.get("nonce");
+  const apiBaseUrl = normalizeUrl(queryParams.get("apiBaseUrl"));
+  const isConnected = queryParams.get("connected") === "1";
 
-  if (!nonce || nonce !== pairing.nonce || !accessToken || !apiBaseUrl) {
+  if (!isConnected || !nonce || nonce !== pairing.nonce || !apiBaseUrl || !pairing.verifier) {
+    return;
+  }
+
+  let claimed;
+  try {
+    claimed = await claimPairingCredentials(apiBaseUrl, pairing.nonce, pairing.verifier);
+  } catch {
+    return;
+  }
+  const accessToken = String(claimed?.accessToken || "").trim();
+  const appBaseUrl = normalizeUrl(claimed?.appBaseUrl || pairing.siteUrl);
+  if (!accessToken) {
     return;
   }
 
@@ -146,7 +160,9 @@ async function handlePairingTabUpdate(tabId, tabUrl) {
   await chrome.storage.local.remove(PAIRING_KEY);
 
   try {
-    await chrome.tabs.remove(tabId);
+    await chrome.tabs.update(tabId, {
+      url: `${appBaseUrl || pairing.siteUrl}${PAIRING_SUCCESS_PATH}?connected=1`
+    });
   } catch {
     // Ignore tabs that are already closed.
   }
@@ -168,6 +184,16 @@ async function readStorageValue(key) {
 
 function createPairingNonce() {
   return crypto.randomUUID().replace(/-/g, "");
+}
+
+function createPairingVerifier() {
+  return `${crypto.randomUUID().replace(/-/g, "")}${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+async function hashStringHex(value) {
+  const bytes = new TextEncoder().encode(String(value || ""));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function normalizeSiteUrl(value) {
@@ -261,6 +287,7 @@ async function uploadEpubToLibrary(prepared, options) {
   await postJson(`${apiBaseUrl}/epubchrome/auth/check`, accessToken, {});
 
   const start = await postJson(`${apiBaseUrl}/epubchrome/upload/start`, accessToken, {
+    kind: "book",
     format: "epub",
     title: prepared.payload.title || "Untitled page",
     originalFilename: prepared.filename
@@ -271,9 +298,17 @@ async function uploadEpubToLibrary(prepared, options) {
   }
 
   const storageId = await uploadBlobToStorage(start.uploadUrl, prepared.epubBlob);
+  const uploadedThumbnail = await uploadThumbnailToLibrary(
+    apiBaseUrl,
+    accessToken,
+    prepared.payload.coverImageUrl,
+    prepared.payload.sourceUrl || prepared.tab?.url || ""
+  );
   const complete = await postJson(`${apiBaseUrl}/epubchrome/upload/complete`, accessToken, {
     uploadTicketId: start.uploadTicketId,
     storageId,
+    thumbnailUploadTicketId: uploadedThumbnail?.uploadTicketId,
+    thumbnailStorageId: uploadedThumbnail?.storageId,
     format: "epub",
     title: prepared.payload.title || "Untitled page",
     author: prepared.payload.author || "",
@@ -289,17 +324,176 @@ async function uploadEpubToLibrary(prepared, options) {
   };
 }
 
+async function claimPairingCredentials(apiBaseUrl, nonce, verifier) {
+  return postJson(`${apiBaseUrl}/epubchrome/pairing/claim`, "", {
+    nonce,
+    verifier
+  });
+}
+
+async function uploadThumbnailToLibrary(apiBaseUrl, accessToken, imageUrl, pageUrl) {
+  const normalizedImageUrl = normalizeUrl(imageUrl);
+  if (!normalizedImageUrl) {
+    return null;
+  }
+
+  const thumbnailBlob = await fetchThumbnailBlob(normalizedImageUrl, pageUrl);
+  if (!thumbnailBlob) {
+    return null;
+  }
+
+  const start = await postJson(`${apiBaseUrl}/epubchrome/upload/start`, accessToken, {
+    kind: "thumbnail"
+  });
+
+  if (!start?.uploadUrl || !start?.uploadTicketId) {
+    return null;
+  }
+
+  const storageId = await uploadBlobToStorage(start.uploadUrl, thumbnailBlob);
+  return {
+    uploadTicketId: start.uploadTicketId,
+    storageId
+  };
+}
+
+async function fetchThumbnailBlob(imageUrl, pageUrl) {
+  if (!isSafeRemoteImageUrl(imageUrl, pageUrl)) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(imageUrl);
+    if (!response.ok) {
+      return null;
+    }
+
+    const blob = await response.blob();
+    if (!blob.type.startsWith("image/")) {
+      return null;
+    }
+
+    return blob;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
 }
 
+function isSafeRemoteImageUrl(imageUrl, pageUrl) {
+  let resourceUrl;
+  try {
+    resourceUrl = new URL(imageUrl);
+  } catch {
+    return false;
+  }
+
+  if (!/^https?:$/i.test(resourceUrl.protocol)) {
+    return false;
+  }
+
+  const resourceHost = normalizeHostname(resourceUrl.hostname);
+  let pageHost = "";
+  if (pageUrl) {
+    try {
+      pageHost = normalizeHostname(new URL(pageUrl).hostname);
+    } catch {
+      pageHost = "";
+    }
+  }
+  if (pageHost && resourceHost === pageHost) {
+    return true;
+  }
+
+  return !isPrivateOrLocalHostname(resourceHost);
+}
+
+function normalizeHostname(hostname) {
+  return String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+function isPrivateOrLocalHostname(hostname) {
+  if (!hostname) {
+    return true;
+  }
+
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    (!hostname.includes(".") && !hostname.includes(":"))
+  ) {
+    return true;
+  }
+
+  if (isPrivateIpv4(hostname) || isPrivateIpv6(hostname)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isPrivateIpv4(hostname) {
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
+    return false;
+  }
+
+  const octets = hostname.split(".").map((part) => Number(part));
+  if (octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return true;
+  }
+
+  const [a, b] = octets;
+  if (a === 10 || a === 127) {
+    return true;
+  }
+  if (a === 169 && b === 254) {
+    return true;
+  }
+  if (a === 172 && b >= 16 && b <= 31) {
+    return true;
+  }
+  if (a === 192 && b === 168) {
+    return true;
+  }
+  if (a === 100 && b >= 64 && b <= 127) {
+    return true;
+  }
+  if (a === 0) {
+    return true;
+  }
+
+  return false;
+}
+
+function isPrivateIpv6(hostname) {
+  if (!hostname.includes(":")) {
+    return false;
+  }
+
+  return (
+    hostname === "::1" ||
+    hostname === "0:0:0:0:0:0:0:1" ||
+    /^fe[89ab][0-9a-f]:/i.test(hostname) ||
+    /^f[cd][0-9a-f]{2}:/i.test(hostname)
+  );
+}
+
 async function postJson(url, accessToken, body) {
+  const headers = {
+    "Content-Type": "application/json"
+  };
+
+  if (String(accessToken || "").trim()) {
+    headers.Authorization = `Bearer ${String(accessToken).trim()}`;
+  }
+
   const response = await fetch(url, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
+    headers,
     body: JSON.stringify(body || {})
   });
 
@@ -353,14 +547,17 @@ async function buildEpub(payload) {
   const title = payload.title || "Untitled page";
   const author = payload.author || "";
   const description = payload.description || "";
-  const coverImage = payload.coverImageUrl ? await fetchNamedImage(payload.coverImageUrl, "cover", "cover") : null;
+  const pageUrl = payload.sourceUrl || "";
+  const coverImage = payload.coverImageUrl
+    ? await fetchNamedImage(payload.coverImageUrl, "cover", "cover", pageUrl)
+    : null;
   const sourceSections = normalizeSections(payload);
   const embeddedSections = [];
   let nextImageIndex = 1;
 
   for (let index = 0; index < sourceSections.length; index += 1) {
     const section = sourceSections[index];
-    const embedded = await embedImages(section.contentXhtml || "", nextImageIndex);
+    const embedded = await embedImages(section.contentXhtml || "", nextImageIndex, pageUrl);
     nextImageIndex = embedded.nextImageIndex;
 
     embeddedSections.push({
@@ -430,7 +627,7 @@ function normalizeSections(payload) {
   }];
 }
 
-async function embedImages(contentXhtml, startIndex = 1) {
+async function embedImages(contentXhtml, startIndex = 1, pageUrl = "") {
   const matches = Array.from(contentXhtml.matchAll(/<img\b[^>]*?\ssrc="([^"]+)"[^>]*>/gi));
   const images = [];
 
@@ -454,7 +651,7 @@ async function embedImages(contentXhtml, startIndex = 1) {
     if (src.startsWith("data:")) {
       replacement = wholeTag;
     } else if (/^https?:/i.test(src) && images.length < 20) {
-      const embedded = await fetchImage(src, nextImageIndex);
+      const embedded = await fetchImage(src, nextImageIndex, pageUrl);
       if (embedded) {
         nextImageIndex += 1;
         images.push(embedded);
@@ -479,11 +676,15 @@ async function embedImages(contentXhtml, startIndex = 1) {
   };
 }
 
-async function fetchImage(url, index) {
-  return fetchNamedImage(url, `image-${index}`, `image-${String(index).padStart(3, "0")}`);
+async function fetchImage(url, index, pageUrl) {
+  return fetchNamedImage(url, `image-${index}`, `image-${String(index).padStart(3, "0")}`, pageUrl);
 }
 
-async function fetchNamedImage(url, id, baseName) {
+async function fetchNamedImage(url, id, baseName, pageUrl = "") {
+  if (!isSafeRemoteImageUrl(url, pageUrl)) {
+    return null;
+  }
+
   try {
     const response = await fetch(url);
     if (!response.ok) {
